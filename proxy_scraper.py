@@ -25,10 +25,12 @@ PROXY_TYPES = {
     "premium": "premium_type.txt",
 }
 
+SUMMARY_LOG = os.path.join(OUTPUT_DIR, "summary.log")
+BAD_FILE = os.path.join(OUTPUT_DIR, "bad.txt")
+
 for f in PROXY_TYPES.values():
     open(os.path.join(OUTPUT_DIR, f), "a").close()
-
-SUMMARY_LOG = os.path.join(OUTPUT_DIR, "summary.log")
+open(BAD_FILE, "a").close()
 
 TEST_TIMEOUT = 5
 CONCURRENCY = 500
@@ -877,6 +879,36 @@ async def scrape_proxifly(session, ptype):
     return proxies
 
 
+async def scrape_socks5proxies(session, ptype):
+    log.info(f"Scraping socks5proxies.com for {ptype}...")
+    proxies = []
+    mapped = {"http": "http", "https": "https", "socks4": "socks4", "socks5": "socks5"}
+    prot = mapped.get(ptype)
+    if not prot:
+        return proxies
+
+    limit = 100
+    offset = 0
+    total = None
+    while total is None or offset < total:
+        url = f"https://api.socks5proxies.com/api/proxies?protocol={prot}&limit={limit}&offset={offset}"
+        data = await fetch_json(session, url)
+        if not data or "data" not in data:
+            break
+        if total is None:
+            total = data.get("meta", {}).get("total", 0)
+        for entry in data["data"]:
+            ip = entry.get("ip", "") or entry.get("host", "")
+            port = entry.get("port", "")
+            if ip and port:
+                anon_map = {4: "elite", 3: "anonymous", 2: "transparent", 1: "distorting", 0: None}
+                anon = anon_map.get(entry.get("anon", 0))
+                proxies.append({"ip:port": f"{ip}:{port}", "type": ptype, "anonymity": anon})
+        offset += limit
+    log.info(f"  socks5proxies.com {ptype}: {len(proxies)} proxies")
+    return proxies
+
+
 async def scrape_sockslist(session, ptype):
     log.info(f"Scraping sockslist.net for {ptype}...")
     proxies = []
@@ -1084,44 +1116,48 @@ def is_premium(proxy_info):
     return any(kw in anon for kw in ["elite", "anonymous", "high anonymity", "premium", "distorting"])
 
 
-def save_proxies(proxies_by_type):
-    for ptype, proxylist in proxies_by_type.items():
-        if not proxylist:
-            continue
-
-        fname = PROXY_TYPES.get(ptype, f"proxies_{ptype}.txt")
+def load_seen_proxies():
+    seen = set()
+    for fname in PROXY_TYPES.values():
         path = os.path.join(OUTPUT_DIR, fname)
-
-        existing = set()
-        if os.path.exists(path) and os.path.getsize(path) > 0:
-            with open(path, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        existing.add(line)
-
-        new_entries = [p["ip:port"] for p in proxylist if p["ip:port"] not in existing]
-        if new_entries:
-            with open(path, "a") as f:
-                for entry in new_entries:
-                    f.write(entry + "\n")
-            log.info(f"Saved {len(new_entries)} new {ptype} proxies to {fname}")
-
-    premium = [p for p in sum(proxies_by_type.values(), []) if is_premium(p)]
-    if premium:
-        path = os.path.join(OUTPUT_DIR, PROXY_TYPES["premium"])
-        existing = set()
         if os.path.exists(path) and os.path.getsize(path) > 0:
             with open(path, "r") as f:
                 for line in f:
                     parts = line.strip().split(" | ")
                     if parts:
-                        existing.add(parts[0])
+                        seen.add((parts[0], "any"))
+    if os.path.exists(BAD_FILE) and os.path.getsize(BAD_FILE) > 0:
+        with open(BAD_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    parts = line.split(" | ")
+                    addr = parts[0]
+                    ptype = "any"
+                    for part in parts[1:]:
+                        if part.startswith("type="):
+                            ptype = part.split("=", 1)[1]
+                    seen.add((addr, ptype))
+    return seen
 
+
+def save_proxies(proxies_by_type):
+    for ptype, proxylist in proxies_by_type.items():
+        if not proxylist:
+            continue
+        fname = PROXY_TYPES.get(ptype, f"proxies_{ptype}.txt")
+        path = os.path.join(OUTPUT_DIR, fname)
+        with open(path, "a") as f:
+            for p in proxylist:
+                f.write(f"{p['ip:port']}\n")
+        log.info(f"Saved {len(proxylist)} {ptype} proxies to {fname}")
+
+    premium = [p for p in sum(proxies_by_type.values(), []) if is_premium(p)]
+    if premium:
+        path = os.path.join(OUTPUT_DIR, PROXY_TYPES["premium"])
         with open(path, "a") as f:
             for p in premium:
-                if p["ip:port"] not in existing:
-                    f.write(f"{p['ip:port']} | type={p['type']} | anon={p.get('anonymity', 'unknown')}\n")
+                f.write(f"{p['ip:port']} | type={p['type']} | anon={p.get('anonymity', 'unknown')}\n")
         log.info(f"Saved {len(premium)} premium proxies to premium_type.txt")
 
 
@@ -1173,6 +1209,7 @@ SOURCES_WITH_PTYPE = {
     "proxy4free": scrape_proxy4free,
     "proxifly": scrape_proxifly,
     "sockslist": scrape_sockslist,
+    "socks5proxies.com": scrape_socks5proxies,
     "premiumproxy.click": scrape_premiumproxy_click,
     "highproxies": scrape_highproxies,
     "elite-proxy": scrape_elite_proxy,
@@ -1224,19 +1261,28 @@ async def run_cycle():
         log.info(f"Total proxies collected: {len(all_proxies)}")
 
         # Deduplicate by (ip:port, type)
-        seen = set()
+        dedup_keys = set()
         deduped = []
         for p in all_proxies:
             key = (p["ip:port"], p["type"])
-            if key not in seen:
-                seen.add(key)
+            if key not in dedup_keys:
+                dedup_keys.add(key)
                 deduped.append(p)
         log.info(f"After dedup: {len(deduped)} proxies")
+
+        # Skip proxies already known (working in files or bad in bad.txt)
+        seen_set = load_seen_proxies()
+        new_proxies = [p for p in deduped if (p["ip:port"], p["type"]) not in seen_set and (p["ip:port"], "any") not in seen_set]
+        log.info(f"New proxies to test: {len(new_proxies)} (skipping {len(deduped) - len(new_proxies)} already seen)")
+
+        if not new_proxies:
+            log.info("No new proxies to test, skipping testing phase")
+            return
 
         log.info("Testing proxies for connectivity...")
         sem = asyncio.Semaphore(CONCURRENCY)
         tested = 0
-        total_to_test = len(deduped)
+        total_to_test = len(new_proxies)
 
         async def test_with_sem(p):
             nonlocal tested
@@ -1247,19 +1293,36 @@ async def run_cycle():
                     log.info(f"  tested {tested}/{total_to_test} proxies...")
                 return result
 
-        tasks = [test_with_sem(p) for p in deduped]
+        tasks = [test_with_sem(p) for p in new_proxies]
         results = await asyncio.gather(*tasks)
 
-        working = [r for r in results if r is not None]
-        log.info(f"Working proxies: {len(working)}/{total_to_test}")
+        working = []
+        failed = []
+        for i, r in enumerate(results):
+            if r is not None:
+                working.append(r)
+            else:
+                failed.append(new_proxies[i])
 
-        proxies_by_type = defaultdict(list)
+        log.info(f"Working proxies: {len(working)}/{total_to_test}; Failed: {len(failed)}")
+
+        working_by_type = defaultdict(list)
         for p in working:
-            proxies_by_type[p["type"]].append(p)
+            working_by_type[p["type"]].append(p)
 
-        log.info(f"Working by type: { {k: len(v) for k, v in proxies_by_type.items()} }")
-        save_proxies(proxies_by_type)
-        write_summary(proxies_by_type, len(all_proxies), len(deduped), len(working))
+        log.info(f"Working by type: { {k: len(v) for k, v in working_by_type.items()} }")
+
+        # Save new working proxies to files
+        save_proxies(working_by_type)
+
+        # Save failed proxies to bad.txt
+        if failed:
+            with open(BAD_FILE, "a") as f:
+                for p in failed:
+                    f.write(f"{p['ip:port']} | type={p['type']}\n")
+            log.info(f"Saved {len(failed)} failed proxies to bad.txt")
+
+        write_summary(working_by_type, len(all_proxies), len(new_proxies), len(working))
 
 
 async def main():
