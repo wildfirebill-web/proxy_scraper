@@ -1,11 +1,11 @@
-Last updated: 2026-05-25 01:04:09
-Total collected: 32915
-After dedup: 195
-Working proxies: 7
+Last updated: 2026-05-29 04:47:30
+Total collected: 33790
+After dedup: 79
+Working proxies: 3
 --- Working by type ---
-  http: 0 -> proxies_http.txt
+  http: 1 -> proxies_http.txt
   https: 0 -> proxies_https.txt
   socks4: 0 -> proxies_socks4.txt
-  socks5: 7 -> proxies_socks5.txt
+  socks5: 2 -> proxies_socks5.txt
   premium: 0 -> premium_type.txt
-  premium (elite/anonymous): 6 -> premium_type.txt
+  premium (elite/anonymous): 3 -> premium_type.txt
